@@ -5,7 +5,7 @@ import random
 waiting_users = set()  # Users waiting for a chat
 active_chats = {}  # Stores active chat pairs
 
-# Dictionary of sample nicknames based on topics
+# Nickname themes based on topics
 nickname_themes = {
     "gaming": ["ShadowGamer", "PixelWarrior", "NoobSlayer", "GameOver"],
     "movies": ["CineFan", "MovieBuff", "ActionHero", "OscarWinner"],
@@ -19,19 +19,18 @@ def generate_nickname(topic):
     return random.choice(nickname_themes.get(topic.lower(), nickname_themes["default"]))
 
 async def match_users(websocket):
-    global waiting_users, active_chats
-
+    """Matches users into chat pairs."""
     await websocket.send("Enter a topic (e.g., gaming, movies, tech):")
     topic = await websocket.recv()
-    nickname = generate_nickname(topic)  # Assign a random nickname
+    nickname = generate_nickname(topic)
     await websocket.send(f"Your nickname is: {nickname}")
 
-    waiting_users.add((websocket, nickname))  # Add user to waiting list
+    waiting_users.add((websocket, nickname))
 
     while (websocket, nickname) in waiting_users:
-        if len(waiting_users) >= 2:  # If there are at least 2 people, match them
+        if len(waiting_users) >= 2:
             waiting_users.remove((websocket, nickname))
-            partner, partner_nickname = waiting_users.pop()  # Get another user
+            partner, partner_nickname = waiting_users.pop()
             active_chats[websocket] = partner
             active_chats[partner] = websocket
 
@@ -40,18 +39,19 @@ async def match_users(websocket):
 
             await chat_session(websocket, partner, nickname, partner_nickname)
             break
-        await asyncio.sleep(1)  # Wait for a match
+        await asyncio.sleep(1)
 
 async def chat_session(user1, user2, nickname1, nickname2):
     """Handles messaging between two users."""
     try:
-        async for message in user1:
-            await user2.send(f"{nickname1}: {message}")
-        async for message in user2:
-            await user1.send(f"{nickname2}: {message}")
+        while True:
+            message1 = await user1.recv()
+            await user2.send(f"{nickname1}: {message1}")
+
+            message2 = await user2.recv()
+            await user1.send(f"{nickname2}: {message2}")
+
     except websockets.exceptions.ConnectionClosed:
-        pass
-    finally:
         await end_chat(user1, user2)
 
 async def end_chat(user1, user2):
@@ -67,11 +67,13 @@ async def end_chat(user1, user2):
     asyncio.create_task(match_users(user1))
     asyncio.create_task(match_users(user2))
 
-async def handler(websocket, path):
+async def handler(websocket):
+    """Handles incoming WebSocket connections."""
     await match_users(websocket)
 
 async def main():
     async with websockets.serve(handler, "0.0.0.0", 8080):  # Change port if needed
         await asyncio.Future()
 
+print("WebSocket server is running on ws://0.0.0.0:8080")
 asyncio.run(main())
