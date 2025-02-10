@@ -1,125 +1,129 @@
-import asyncio
-import websockets
+from flask import Flask, request
+from flask_socketio import SocketIO, emit, disconnect
 import random
 from collections import defaultdict
 
-# Use locks to prevent race conditions with shared data
-waiting_users_lock = asyncio.Lock()
-active_chats_lock = asyncio.Lock()
+app = Flask(__name__)
+socketio = SocketIO(app, cors_allowed_origins="*")
 
-waiting_users = set()  # Stores (websocket, nickname) tuples
-active_chats = defaultdict(lambda: None)  # Stores bidirectional connections
+user_info = {}  # {session_id: {nickname: str, topics: list}}
+active_chats = {}  # {session_id: partner_session_id}
+waiting_queues = defaultdict(list)  # {topic: [session_ids]}
+users_in_queue = set()  # To prevent duplicate joins
 
 nickname_themes = {
-    "gaming": ["ShadowGamer", "PixelWarrior", "NoobSlayer", "GameOver"],
-    "movies": ["CineFan", "MovieBuff", "ActionHero", "OscarWinner"],
-    "music": ["RockStar", "DJVibes", "MelodyMaker", "BassBooster"],
-    "tech": ["CodeMaster", "AI_Guru", "CyberHacker", "TechWizard"],
-    "default": ["Anon1", "MysteryUser", "SecretTalker", "ChatGhost"]
+    "gaming": {"adjectives": ["Shadow", "Pixel", "Cyber"], "nouns": ["Gamer", "Warrior", "Ninja"]},
+    "movies": {"adjectives": ["Cinematic", "Action", "Fantasy"], "nouns": ["Buff", "Critic", "Star"]},
+    "music": {"adjectives": ["Melodic", "Electric", "Funky"], "nouns": ["Vibes", "Beat", "Diva"]},
+    "tech": {"adjectives": ["Binary", "Quantum", "Cyber"], "nouns": ["Coder", "Bot", "Hacker"]},
+    "random": {"adjectives": ["Mystery", "Silent", "Hidden"], "nouns": ["Stranger", "Anon", "Ghost"]}
 }
 
 def generate_nickname(topic):
-    """Sanitize topic input and generate nickname"""
-    clean_topic = (topic or "default").strip().lower()
-    return random.choice(nickname_themes.get(clean_topic, nickname_themes["default"]))
+    theme = nickname_themes.get(topic, nickname_themes["random"])
+    return f"{random.choice(theme['adjectives'])}{random.choice(theme['nouns'])}{random.randint(1, 999)}"
 
-async def match_users(websocket):
-    """Match users with proper error handling"""
-    try:
-        await websocket.send("Enter a topic (e.g., gaming, movies, tech):")
-        topic = await websocket.recv()
-        nickname = generate_nickname(topic)
-        await websocket.send(f"Your nickname is: {nickname}")
+@app.route("/")
+def home():
+    return "WebSocket server is running!"
 
-        async with waiting_users_lock:
-            waiting_users.add((websocket, nickname))
+@socketio.on("join")
+def handle_join(data):
+    user = request.sid
+    topics = data.get("topics", ["random"])
 
-        while True:
-            async with waiting_users_lock:
-                if len(waiting_users) >= 2 and (websocket, nickname) in waiting_users:
-                    # Remove both users atomically
-                    waiting_users.remove((websocket, nickname))
-                    partner, partner_nickname = waiting_users.pop()
-                    
-                    async with active_chats_lock:
-                        active_chats[websocket] = partner
-                        active_chats[partner] = websocket
+    if user in users_in_queue:
+        print(f"User {user} tried to join again, ignoring.")
+        return  
 
-                    # Notify both users
-                    await asyncio.gather(
-                        websocket.send(f"Matched! Chatting with {partner_nickname}"),
-                        partner.send(f"Matched! Chatting with {nickname}")
-                    )
-                    
-                    # Start bidirectional chat
-                    await asyncio.gather(
-                        chat_session(websocket, partner, nickname, partner_nickname),
-                        chat_session(partner, websocket, partner_nickname, nickname)
-                    )
-                    break
-            await asyncio.sleep(1)
+    users_in_queue.add(user)
+    nickname = generate_nickname(topics[0])
+    user_info[user] = {"nickname": nickname, "topics": topics}
 
-    except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
-        await cleanup_connection(websocket)
+    emit("nickname", nickname)
 
-async def chat_session(sender, receiver, sender_nick, receiver_nick):
-    """Handle bidirectional messaging with timeouts"""
-    try:
-        while True:
-            message = await asyncio.wait_for(sender.recv(), timeout=300)
-            await receiver.send(f"{sender_nick}: {message}")
-            
-    except (asyncio.TimeoutError, websockets.exceptions.ConnectionClosed):
-        await end_chat(sender, receiver)
+    # Add user to all selected topics
+    for topic in topics:
+        if user not in waiting_queues[topic]:
+            waiting_queues[topic].append(user)
 
-async def end_chat(user1, user2):
-    """Safely end chat and cleanup"""
-    async with active_chats_lock:
-        for user in [user1, user2]:
-            if active_chats[user]:
-                del active_chats[user]
+    print(f"User {user} ({nickname}) joined topics {topics}.")
+    try_match()
 
-    # Notify users if still connected
-    for user in [user1, user2]:
-        try:
-            await user.send("Partner disconnected. Reconnecting...")
-            asyncio.create_task(match_users(user))
-        except (websockets.exceptions.ConnectionClosed, RuntimeError):
-            pass
+def try_match():
+    matched_users = set()
 
-async def cleanup_connection(websocket):
-    """Handle abandoned connections"""
-    async with waiting_users_lock, active_chats_lock:
-        # Remove from waiting list
-        for entry in list(waiting_users):
-            if entry[0] == websocket:
-                waiting_users.remove(entry)
-        
-        # Remove from active chats
-        partner = active_chats.get(websocket)
-        if partner:
-            del active_chats[partner]
-            del active_chats[websocket]
-            try:
-                await partner.send("Partner disconnected. Reconnecting...")
-                asyncio.create_task(match_users(partner))
-            except websockets.exceptions.ConnectionClosed:
-                pass
+    for topic, queue in list(waiting_queues.items()):  
+        queue[:] = [u for u in queue if u in user_info]  # Remove disconnected users
 
-async def handler(websocket):
-    """Connection handler with proper cleanup"""
-    try:
-        await match_users(websocket)
-    finally:
-        await cleanup_connection(websocket)
+        while len(queue) >= 2:
+            user1 = queue.pop(0)
+            user2 = queue.pop(0)
 
-async def main():
-    async with websockets.serve(handler, "0.0.0.0", 8080, ping_interval=None):
-        print("WebSocket server running on ws://0.0.0.0:8080")
-        await asyncio.Future()
+            if user1 == user2:  
+                queue.append(user1)
+                continue
+
+            active_chats[user1] = user2
+            active_chats[user2] = user1
+
+            emit("matched", {"partner_nickname": user_info[user2]["nickname"]}, room=user1)
+            emit("matched", {"partner_nickname": user_info[user1]["nickname"]}, room=user2)
+
+            print(f"Matched {user1} ({user_info[user1]['nickname']}) with {user2} ({user_info[user2]['nickname']}) in topic {topic}.")
+            matched_users.update({user1, user2})
+
+    for user in matched_users:
+        users_in_queue.discard(user)
+
+@socketio.on("disconnect")
+def handle_disconnection():
+    user = request.sid
+    partner = active_chats.pop(user, None)
+
+    if partner:
+        del active_chats[partner]
+        emit("partner_left", {"message": "Your chat partner left. Searching for a new match..."}, room=partner)
+        if partner in user_info:
+            topics = user_info[partner]["topics"]
+            for topic in topics:
+                if partner not in waiting_queues[topic]:
+                    waiting_queues[topic].append(partner)
+            try_match()
+
+    if user in user_info:
+        topics = user_info[user]["topics"]
+        for topic in topics:
+            if user in waiting_queues[topic]:
+                waiting_queues[topic].remove(user)
+    user_info.pop(user, None)
+    users_in_queue.discard(user)
+@socketio.on("message")
+def handle_message(data):
+    sender = request.sid
+    if sender in active_chats:
+        receiver = active_chats[sender]
+        message_data = {"text": data["message"], "from": user_info[sender]["nickname"]}
+
+        # Send message to both users
+        emit("message", message_data, room=sender)  # Show message in sender's chatbox
+        emit("message", message_data, room=receiver)  # Send message to receiver
+@socketio.on("message")
+def handle_message(data):
+    sender = request.sid
+    if sender in active_chats:
+        receiver = active_chats[sender]
+        message_data = {"text": data["message"], "from": user_info[sender]["nickname"]}
+
+        print(f"Message received from {user_info[sender]['nickname']} to {user_info[receiver]['nickname']}: {data['message']}")  # Debugging print
+
+        emit("message", message_data, room=sender)  # Show message in sender's chatbox
+        emit("message", message_data, room=receiver)  # Send message to receiver
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nServer shut down gracefully")
+    socketio.run(app, host="0.0.0.0", port=8080)
+import os
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    socketio.run(app, host="0.0.0.0", port=port)
