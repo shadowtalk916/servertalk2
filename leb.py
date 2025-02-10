@@ -120,8 +120,5 @@ def handle_message(data):
         emit("message", message_data, room=sender)  # Show message in sender's chatbox
         emit("message", message_data, room=receiver)  # Send message to receiver
 
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    socketio.run(app, host="0.0.0.0", port=port)
+    socketio.run(app, host="0.0.0.0", port=8080)
